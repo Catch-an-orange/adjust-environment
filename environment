@@ -1,0 +1,189 @@
+"""
+第十二周模型微调完整系统 (V1.0)
+功能：集成动态权重模块与空间注意力机制的模型微调
+"""
+
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.cuda.amp import GradScaler, autocast
+import matplotlib.pyplot as plt
+import csv
+from datetime import datetime
+import os
+from typing import Dict, List, Tuple
+
+
+class FineTuneSystem:
+    def __init__(self, model: nn.Module, config: Dict):
+        """
+        初始化微调系统
+        :param model: 待微调的模型(需已集成MGA和空间注意力模块)
+        :param config: 配置字典示例:
+            {
+                'device': 'cuda',
+                'checkpoint_dir': './checkpoints',
+                'log_path': './training_log.csv',
+                'l2_coef': 0.01,
+                'target_fid': 25
+            }
+        """
+        self.model = model
+        self.config = config
+        self.scaler = GradScaler()
+        self.logger = TrainingLogger(config['log_path'])
+        os.makedirs(config['checkpoint_dir'], exist_ok=True)
+
+        # 从第8周加载MGA初始化参数
+        if os.path.exists('./mga_init_weights.ckpt'):
+            self._load_mga_weights()
+
+    def _load_mga_weights(self):
+        """加载历史MGA网络权重"""
+        mga_weights = torch.load('./mga_init_weights.ckpt')
+        self.model.mga_net.load_state_dict(mga_weights)
+        print("MGA权重加载成功")
+
+    def configure_environment(self) -> Tuple[torch.device, GradScaler]:
+        """配置混合精度训练环境"""
+        torch.backends.cudnn.benchmark = True
+        return torch.device(self.config['device']), self.scaler
+
+    def train_epoch(self, train_loader, epoch: int) -> float:
+        """
+        执行完整epoch训练 (batch_size=16)
+        :return: 平均训练损失
+        """
+        device, _ = self.configure_environment()
+        optimizer = AdamW(self.model.parameters(), lr=3e-5)
+        total_loss = 0.0
+
+        for step, batch in enumerate(train_loader):
+            try:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                loss = self._train_step(batch, optimizer)
+                total_loss += loss
+
+                # 每100步保存检查点
+                if step % 100 == 0:
+                    self._save_checkpoint(f"epoch{epoch}_step{step}")
+
+                # 记录日志
+                self.logger.log(epoch, step, loss, {'batch_loss': loss})
+
+            except Exception as e:
+                print(f"训练异常: {str(e)}")
+                self._rollback_checkpoint()
+                raise RuntimeError("训练中断，已回滚到上一个检查点")
+
+        return total_loss / len(train_loader)
+
+    def _train_step(self, batch, optimizer) -> float:
+        """单步训练(含L2正则化)"""
+        with autocast():
+            outputs = self.model(batch)
+            loss = outputs['loss']
+            loss += self.config['l2_coef'] * sum(p.pow(2).sum() for p in self.model.parameters())
+
+        self.scaler.scale(loss).backward()
+        self.scaler.step(optimizer)
+        self.scaler.update()
+        optimizer.zero_grad()
+        return loss.item()
+
+    def _save_checkpoint(self, name: str):
+        """保存模型检查点(保留最近3个版本)"""
+        ckpt_path = os.path.join(self.config['checkpoint_dir'], f"{name}.ckpt")
+        torch.save(self.model.state_dict(), ckpt_path)
+
+        # 清理旧检查点
+        existing_ckpts = sorted(os.listdir(self.config['checkpoint_dir']))
+        for old_ckpt in existing_ckpts[:-3]:
+            os.remove(os.path.join(self.config['checkpoint_dir'], old_ckpt))
+
+    def _rollback_checkpoint(self):
+        """回滚到最近检查点"""
+        existing_ckpts = os.listdir(self.config['checkpoint_dir'])
+        if existing_ckpts:
+            latest_ckpt = sorted(existing_ckpts)[-1]
+            self.model.load_state_dict(torch.load(latest_ckpt))
+            print(f"已回滚到检查点: {latest_ckpt}")
+
+    def generate_comparison(self, val_loader, attributes: List) -> str:
+        """
+        生成验证集对比图(4组属性组合)
+        :return: 图片保存路径
+        """
+        device, _ = self.configure_environment()
+        self.model.eval()
+
+        fig, axs = plt.subplots(2, 2, figsize=(12, 12))
+        for i, attr in enumerate(attributes[:4]):
+            with torch.no_grad():
+                output = self.model.generate(attr.to(device)).cpu()
+            axs[i // 2, i % 2].imshow(output.permute(1, 2, 0))
+            axs[i // 2, i % 2].set_title(str(attr))
+
+        save_path = os.path.join(self.config['checkpoint_dir'], 'comparison.png')
+        plt.savefig(save_path)
+        self.model.train()
+        return save_path
+
+    def convert_to_fp16(self, ckpt_path: str) -> str:
+        """模型权重转换为FP16格式"""
+        self.model.load_state_dict(torch.load(ckpt_path))
+        self.model.half()
+        fp16_path = ckpt_path.replace('.ckpt', '_fp16.ckpt')
+        torch.save(self.model.state_dict(), fp16_path)
+        return fp16_path
+
+
+class TrainingLogger:
+    """训练日志记录器(CSV格式)"""
+
+    def __init__(self, log_path: str):
+        self.file = open(log_path, 'a', newline='')
+        self.writer = csv.writer(self.file)
+        self.writer.writerow(['timestamp', 'epoch', 'step', 'loss', 'metrics'])
+
+    def log(self, epoch: int, step: int, loss: float, metrics: Dict):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.writer.writerow([timestamp, epoch, step, loss, str(metrics)])
+        self.file.flush()  # 确保实时写入
+
+    def close(self):
+        self.file.close()
+
+
+# 示例用法
+if __name__ == "__main__":
+    from models import CustomModel  # 假设已定义模型
+
+    config = {
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'checkpoint_dir': './week12_checkpoints',
+        'log_path': './training_log.csv',
+        'l2_coef': 0.01,
+        'target_fid': 25
+    }
+
+    # 初始化系统
+    model = CustomModel()  # 需包含MGA和空间注意力模块
+    system = FineTuneSystem(model, config)
+
+    # 模拟训练流程
+    train_loader = ...  # 数据加载器
+    for epoch in range(5):
+        avg_loss = system.train_epoch(train_loader, epoch)
+        print(f"Epoch {epoch} 平均损失: {avg_loss:.4f}")
+
+    # 生成验证样例
+    val_attributes = [...]  # 验证属性列表
+    system.generate_comparison(val_attributes)
+
+    # 最终模型转换
+    final_ckpt = os.path.join(config['checkpoint_dir'], 'final.ckpt')
+    torch.save(model.state_dict(), final_ckpt)
+    system.convert_to_fp16(final_ckpt)
+
+    system.logger.close()
